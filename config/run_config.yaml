@@ -1,0 +1,47 @@
+# Pipeline run configuration.
+#
+# `keywords` and `enrichment_columns` below are the aerial-work-platform lists
+# this pipeline currently runs with -- they are live values, not placeholders.
+# They are also the two settings you edit per job: change them to retarget the
+# run at a different product category without touching any code.
+
+# Directory containing the raw input .xlsx files.
+input_dir: Documents
+
+# Keyword list (l): used for semantic (not substring) relevance judgment
+# against each row's PRODUCT DETAILS text.
+keywords:
+  - articulated
+  - Telescopic
+  - vertical mast
+  - scissor
+  - aerial working platform
+  - boom lift
+
+# New columns (c) to append to the consolidated file during enrichment.
+# Each entry is just a column name/intent string; enrichment logic is generic
+# and does not assume anything about what these columns mean.
+enrichment_columns:
+  - Brand/Company Name
+  - Product name (articulating lift, telescopic lift, scissor lift, spider lift, vertical mast, etc)
+  - New OR Used
+  - Model number
+  - Power source(Battery, Diesel, Electricity, etc)
+  - Operating Height
+
+# Rows sent to the LLM per relevance-judgment batch (Stage 1).
+relevance_batch_size: 50
+
+# Relevance-judgment batches allowed to run concurrently, shared across the
+# WHOLE run (not per file) -- e.g. 10 means at most 10 batches in flight at
+# once even while multiple files are being processed simultaneously.
+relevance_concurrency: 10
+
+# Rows sent to the LLM per local-derivation batch (Stage 3).
+enrichment_batch_size: 25
+
+# Output locations (relative to project root unless absolute).
+filtered_dir: data/filtered
+consolidated_dir: data/consolidated
+output_dir: data/output
+logs_dir: logs

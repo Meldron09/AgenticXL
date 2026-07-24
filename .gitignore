@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# Secrets
+.env
+
+# Input data: real third-party trade records -- never commit
+Documents/
+
+# Generated pipeline outputs
+data/filtered/
+data/consolidated/
+data/output/
+
+# Generated run logs and per-row rationale logs
+logs/
+
+# macOS
+.DS_Store
