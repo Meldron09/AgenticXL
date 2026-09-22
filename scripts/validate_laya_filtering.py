@@ -192,6 +192,50 @@ def sweep_thresholds(
     return results
 
 
+def write_score_dump(
+    path: str | Path,
+    per_file_data: dict[str, tuple[dict[int, bool], dict[int, float]]],
+    threshold: float,
+    model_identifier: str,
+    *,
+    question_mode: str | None = None,
+    payload_layout: str | None = None,
+) -> Path:
+    """Persist every row's raw laya score across every file classified this run
+    (the full corpus when --sample-per-file is omitted) as one JSON line per
+    row, sorted by (source_file, row_id): laya's own output, independent of
+    the LLM baseline it's compared against elsewhere in this script.
+
+    `question_mode`/`payload_layout` are optional (issue #6/#8): when a caller
+    passes them (`scripts/build_laya_redesign_report.py` scoring one of the four
+    `LayaClient` variants against ground truth), each record also carries
+    `question_mode`, `payload_layout`, and `threshold`, so dumps from different
+    variants stay independently auditable. Omitted by every existing caller of
+    this function, which keeps their output byte-identical to before."""
+    if (question_mode is None) != (payload_layout is None):
+        raise ValueError("question_mode and payload_layout must be given together, or not at all")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for source_file in sorted(per_file_data):
+            _, scores = per_file_data[source_file]
+            for row_id in sorted(scores):
+                score = scores[row_id]
+                record = {
+                    "source_file": source_file,
+                    "row_id": row_id,
+                    "score": score,
+                    "match": score >= threshold,
+                    "model": model_identifier,
+                }
+                if question_mode is not None:
+                    record["question_mode"] = question_mode
+                    record["payload_layout"] = payload_layout
+                    record["threshold"] = threshold
+                f.write(json.dumps(record) + "\n")
+    return path
+
+
 def _print_report(source_file: str, report: AgreementReport) -> None:
     print(
         f"  {source_file}: agreement={report.agreement_rate:.1%} "
@@ -216,6 +260,12 @@ def main(argv: list[str] | None = None) -> int:
         "--report-path",
         default="logs/laya_validation_report.json",
         help="Where to write the JSON validation report.",
+    )
+    parser.add_argument(
+        "--scores-path",
+        default="logs/laya_predictions.jsonl",
+        help="Where to write laya's raw per-row scores (its own output, independent of "
+        "the LLM baseline), one JSON line per row.",
     )
     args = parser.parse_args(argv)
 
@@ -319,6 +369,12 @@ def main(argv: list[str] | None = None) -> int:
         encoding="utf-8",
     )
     print(f"\nFull report written to {report_path}")
+
+    scores_path = Path(args.scores_path)
+    if not scores_path.is_absolute():
+        scores_path = run_config.project_root / scores_path
+    write_score_dump(scores_path, per_file_data, best_threshold, client.model_identifier)
+    print(f"Per-row laya scores written to {scores_path}")
     return 0
 
 

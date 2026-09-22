@@ -8,6 +8,7 @@ from scripts.validate_laya_filtering import (
     AgreementReport,
     compute_agreement,
     load_baseline,
+    write_score_dump,
 )
 
 
@@ -115,3 +116,57 @@ def test_load_baseline_rejects_empty_file(tmp_path):
 
     with pytest.raises(ValueError):
         load_baseline(path)
+
+
+def test_write_score_dump_writes_one_sorted_line_per_row(tmp_path):
+    per_file_data = {
+        "b.xlsx": ({1: True, 0: False}, {1: 0.9, 0: 0.2}),
+        "a.xlsx": ({0: True}, {0: 0.7}),
+    }
+    path = tmp_path / "laya_predictions.jsonl"
+
+    result_path = write_score_dump(path, per_file_data, threshold=0.65, model_identifier="fake@rev")
+
+    assert result_path == path
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    assert lines == [
+        {"source_file": "a.xlsx", "row_id": 0, "score": 0.7, "match": True, "model": "fake@rev"},
+        {"source_file": "b.xlsx", "row_id": 0, "score": 0.2, "match": False, "model": "fake@rev"},
+        {"source_file": "b.xlsx", "row_id": 1, "score": 0.9, "match": True, "model": "fake@rev"},
+    ]
+
+
+def test_write_score_dump_tags_records_with_variant_fields_when_given(tmp_path):
+    per_file_data = {"a.xlsx": ({0: True}, {0: 0.7})}
+    path = tmp_path / "laya_predictions.jsonl"
+
+    write_score_dump(
+        path,
+        per_file_data,
+        threshold=0.65,
+        model_identifier="fake@rev",
+        question_mode="per_keyword",
+        payload_layout="convention",
+    )
+
+    (line,) = [json.loads(line) for line in path.read_text().splitlines()]
+    assert line == {
+        "source_file": "a.xlsx",
+        "row_id": 0,
+        "score": 0.7,
+        "match": True,
+        "model": "fake@rev",
+        "question_mode": "per_keyword",
+        "payload_layout": "convention",
+        "threshold": 0.65,
+    }
+
+
+def test_write_score_dump_rejects_a_partial_variant_tag(tmp_path):
+    per_file_data = {"a.xlsx": ({0: True}, {0: 0.7})}
+    path = tmp_path / "laya_predictions.jsonl"
+
+    with pytest.raises(ValueError):
+        write_score_dump(
+            path, per_file_data, threshold=0.65, model_identifier="fake@rev", question_mode="combined"
+        )
