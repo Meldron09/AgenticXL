@@ -4,6 +4,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
+from agenticxl.filtering.laya_client import LayaVerdict
 from agenticxl.models.base import LLMClient
 
 
@@ -52,3 +53,27 @@ class FakeLLMClient(LLMClient):
         if self._structured_responder is None:
             raise NotImplementedError("no structured_responder configured")
         return self._structured_responder(prompt, schema)
+
+
+class FakeLayaClient:
+    """Deterministic LayaClient stub for tests: `responder(rows, keywords, threshold)`
+    returns the list[LayaVerdict] `judge_batch` should return. With no responder,
+    every row comes back a non-match -- the same never-guess default LayaClient
+    itself falls back to on a failed/malformed batch."""
+
+    def __init__(self, responder=None):
+        self._responder = responder
+
+    @property
+    def model_identifier(self) -> str:
+        return "fake"
+
+    def judge_batch(
+        self, rows: list[tuple[int, str]], keywords: list[str], threshold: float = 0.5
+    ) -> list[LayaVerdict]:
+        if self._responder is None:
+            return [
+                LayaVerdict(row_id=row_id, match=False, score=0.0, confidence=0.0, model="fake")
+                for row_id, _text in rows
+            ]
+        return self._responder(rows, keywords, threshold)
