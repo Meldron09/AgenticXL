@@ -101,9 +101,47 @@ class Qwen3RerankerScorer:
         return out
 
 
+class GLiClassScorer:
+    """GLiClass large v3.0: ONE multi-label pass per row with every keyword as a
+    label; row probability = max over the keywords' scores. Labels are the raw
+    keywords verbatim (the frozen `template` records that), and threshold=0.0
+    makes the pipeline return every label's score so the driver's fixed 0.5 cut
+    is the only cut."""
+
+    name = "gliclass-large-v3.0"
+    model_id = "knowledgator/gliclass-large-v3.0"
+    revision = "e065d1844f913a9aa611cf33623a9538b8aa8841"
+    gate_eligible = True
+    template = "{keywords}"  # each keyword is passed verbatim as one label; no hypothesis wrapping
+
+    def __init__(self, keywords: list[str], batch_size: int = 8):
+        self._labels = list(keywords)
+        self._batch_size = batch_size
+        self._pipeline = None
+
+    def _load(self):
+        if self._pipeline is None:
+            import torch  # lazy: optional `bakeoff` extra
+            from gliclass import GLiClassModel, ZeroShotClassificationPipeline
+            from transformers import AutoTokenizer
+
+            model = GLiClassModel.from_pretrained(self.model_id, revision=self.revision)
+            tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            self._pipeline = ZeroShotClassificationPipeline(
+                model, tok, classification_type="multi-label", device=device
+            )
+        return self._pipeline
+
+    def score(self, texts: list[str]) -> list[float]:
+        results = self._load()(texts, self._labels, threshold=0.0, batch_size=self._batch_size)
+        return [max((r["score"] for r in per_text), default=0.0) for per_text in results]
+
+
 # Registry: candidate name -> factory(keywords) -> Scorer. One line per candidate.
 CANDIDATES: dict[str, Callable[[list[str]], Scorer]] = {
     Qwen3RerankerScorer.name: Qwen3RerankerScorer,
+    GLiClassScorer.name: GLiClassScorer,
 }
 
 
