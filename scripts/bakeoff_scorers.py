@@ -101,9 +101,57 @@ class Qwen3RerankerScorer:
         return out
 
 
+class GteModernBertRerankerScorer:
+    """gte-reranker-modernbert-base: a cross-encoder with a single-logit head;
+    one (query, document) pair per row, probability = sigmoid(logit). Follows
+    the model card's AutoModelForSequenceClassification usage."""
+
+    name = "gte-reranker-modernbert-base"
+    model_id = "Alibaba-NLP/gte-reranker-modernbert-base"
+    revision = "f7481e6055501a30fb19d090657df9ec1f79ab2c"
+    gate_eligible = True
+    template = (
+        "Given a shipment record's product description, judge whether it describes "
+        "any of the listed products, a clear synonym of one, or an obvious sub-component, "
+        "variant or accessory of one. Products: {keywords}"
+    )
+
+    def __init__(self, keywords: list[str], batch_size: int = 8, max_length: int = 1024):
+        self._query = fill_template(self.template, keywords)
+        self._batch_size = batch_size
+        self._max_length = max_length
+        self._loaded = None
+
+    def _load(self):
+        if self._loaded is None:
+            import torch  # lazy: optional `bakeoff` extra
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
+            model = AutoModelForSequenceClassification.from_pretrained(self.model_id, revision=self.revision).eval()
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            model.to(device)
+            self._loaded = (torch, tok, model, device)
+        return self._loaded
+
+    def score(self, texts: list[str]) -> list[float]:
+        torch, tok, model, device = self._load()
+        out: list[float] = []
+        for i in range(0, len(texts), self._batch_size):
+            docs = texts[i : i + self._batch_size]
+            # only_second: truncate the document, never the criteria
+            batch = tok([self._query] * len(docs), docs, padding=True, truncation="only_second",
+                        max_length=self._max_length, return_tensors="pt").to(device)
+            with torch.no_grad():
+                logits = model(**batch).logits.view(-1)
+            out.extend(torch.sigmoid(logits.float()).cpu().tolist())
+        return out
+
+
 # Registry: candidate name -> factory(keywords) -> Scorer. One line per candidate.
 CANDIDATES: dict[str, Callable[[list[str]], Scorer]] = {
     Qwen3RerankerScorer.name: Qwen3RerankerScorer,
+    GteModernBertRerankerScorer.name: GteModernBertRerankerScorer,
 }
 
 
