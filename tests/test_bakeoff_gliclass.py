@@ -3,6 +3,7 @@ with a fake `gliclass`/`transformers`/`torch` runtime -- no model, no network.""
 
 from __future__ import annotations
 
+import math
 import sys
 import types
 
@@ -72,3 +73,15 @@ def test_checkpoint_loaded_at_pinned_revision_and_only_once(fake_runtime):
     scorer.score(["y"])
 
     assert [kw["revision"] for _, kw in _FakePipeline.loads] == [scorer.revision] * 2  # model + tokenizer
+
+
+def test_row_with_no_returned_labels_is_a_bad_score_not_zero(fake_runtime, monkeypatch):
+    monkeypatch.setattr(
+        _FakePipeline, "__call__",
+        lambda self, texts, labels, threshold, batch_size: [[], [{"label": "lift", "score": 0.9}]],
+    )
+    scorer = build_scorers(["gliclass-large-v3.0"], ["lift"])[0]
+
+    probs = scorer.score(["a", "b"])
+
+    assert math.isnan(probs[0]) and probs[1] == 0.9

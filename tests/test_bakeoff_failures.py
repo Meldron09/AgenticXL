@@ -177,3 +177,24 @@ def test_a_bad_score_on_a_duplicated_text_fails_every_row_sharing_it():
     result = evaluate_candidate(scorer, rows, labels, pools)
 
     assert sorted(result.failed_rows) == [0, 1]
+
+
+# --- JSON must not publish placeholder / meaningless metrics (review fixes) ---
+
+
+def test_could_not_run_json_has_null_metrics_and_downstream_survives():
+    results = run_bakeoff([FakeScorer("bad", scores_fn=_boom), FakeScorer("good", _oracle)], ROWS, LABELS, POOLS)
+    report = build_report(results, ["scissor"], 10, POOLS, ROWS, LABELS)
+    bad = report["candidates"][0]
+
+    assert bad["raw"] is None and bad["population_weighted"] is None and bad["auroc"] is None
+    assert report["candidates"][1]["raw"]["total"] == 10
+    assert "| bad | COULD-NOT-RUN | n/a |" in render_markdown(report)
+
+
+def test_gate_ineligible_json_publishes_auroc_only():
+    (result,) = run_bakeoff([FakeScorer("ref", _oracle, gate_eligible=False)], ROWS, LABELS, POOLS)
+    (c,) = build_report([result], ["scissor"], 10, POOLS)["candidates"]
+
+    assert c["raw"] is None and c["population_weighted"] is None
+    assert c["auroc"] == 1.0 and c["verdict"] == "AUROC-only"

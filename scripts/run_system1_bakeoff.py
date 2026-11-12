@@ -24,8 +24,9 @@ Layout (so parallel tickets touch different functions):
 
 Usage:
     .venv/bin/pip install -e ".[bakeoff]"
-    .venv/bin/python scripts/run_system1_bakeoff.py
-    .venv/bin/python scripts/run_system1_bakeoff.py --candidates qwen3-reranker-0.6b
+    .venv/bin/python -m scripts.run_system1_bakeoff
+    .venv/bin/python -m scripts.run_system1_bakeoff --candidates qwen3-reranker-0.6b
+(run from the repo root with `-m`: the script imports the `scripts` package)
 """
 
 from __future__ import annotations
@@ -75,10 +76,10 @@ class CandidateResult:
     gate_eligible: bool
     status: str  # "ok" | "could_not_run"
     seconds: float
-    raw: ClassifierMetrics
-    population_weighted: ClassifierMetrics
+    raw: ClassifierMetrics | None  # None when could_not_run
+    population_weighted: ClassifierMetrics | None  # None when could_not_run
     auroc: float | None
-    verdict: str  # "GO" | "NO-GO" | "AUROC-only"
+    verdict: str  # "GO" | "NO-GO" | "AUROC-only" | "COULD-NOT-RUN"
     scores: dict[int, float]  # sample_index -> probability (kept for #14 miss lists; not in the JSON)
     failed_rows: list[int] = field(default_factory=list)  # sample_index of rows with a non-finite / out-of-range score (#13)
     error: str | None = None  # reason, when status == "could_not_run" (#13)
@@ -170,11 +171,10 @@ def evaluate_candidate(
 
 
 def _could_not_run(scorer: Scorer, seconds: float, error: str) -> CandidateResult:
-    zero = ClassifierMetrics(0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)  # placeholder; the report shows n/a
     return CandidateResult(
         name=scorer.name, model_id=scorer.model_id, revision=scorer.revision, template=scorer.template,
-        gate_eligible=scorer.gate_eligible, status="could_not_run", seconds=seconds, raw=zero,
-        population_weighted=zero, auroc=None, verdict="COULD-NOT-RUN", scores={}, error=error,
+        gate_eligible=scorer.gate_eligible, status="could_not_run", seconds=seconds, raw=None,
+        population_weighted=None, auroc=None, verdict="COULD-NOT-RUN", scores={}, error=error,
     )
 
 
@@ -315,8 +315,11 @@ def build_report(
                 "gate_eligible": r.gate_eligible,
                 "status": r.status,
                 "seconds": r.seconds,
-                "raw": asdict(r.raw),
-                "population_weighted": asdict(r.population_weighted),
+                # null unless a 0.5 cut means something: not for could-not-run, not for AUROC-only references (#19)
+                "raw": asdict(r.raw) if r.status == "ok" and r.gate_eligible is True else None,
+                "population_weighted": (
+                    asdict(r.population_weighted) if r.status == "ok" and r.gate_eligible is True else None
+                ),
                 "auroc": r.auroc,
                 "verdict": r.verdict,
                 "failed_rows": r.failed_rows,
@@ -505,11 +508,13 @@ def render_markdown(report: dict) -> str:
     return "\n".join(line for section in _SECTIONS for line in section(report)) + "\n"
 
 
-def write_report(report: dict, json_path: str | Path, markdown_path: str | Path) -> tuple[Path, Path]:
+def write_report(
+    report: dict, json_path: str | Path, markdown_path: str | Path, render=render_markdown
+) -> tuple[Path, Path]:
     json_path, markdown_path = Path(json_path), Path(markdown_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    markdown_path.write_text(render_markdown(report), encoding="utf-8")
+    markdown_path.write_text(render(report), encoding="utf-8")
     return json_path, markdown_path
 
 
@@ -525,6 +530,7 @@ class FullCorpusResult:
     overall: ClassifierMetrics  # candidate vs the Baseline judge's verdicts; its "accuracy" is agreement
     per_file: dict[str, ClassifierMetrics]
     skipped: list[tuple[str, str]]  # (source_file, reason)
+    failed: int = 0  # rows with a non-finite / out-of-range score; counted as disagreements
 
 
 def evaluate_full_corpus(scorer: Scorer, run_config: RunConfig) -> FullCorpusResult:
@@ -537,8 +543,13 @@ def evaluate_full_corpus(scorer: Scorer, run_config: RunConfig) -> FullCorpusRes
     skipped: list[tuple[str, str]] = []
     all_baseline: dict[tuple[str, int], bool] = {}
     all_pred: dict[tuple[str, int], bool] = {}
+    failed = 0
     for path in sorted(run_config.logs_dir_resolved.glob("*_rationale.jsonl")):
-        source_file, records = load_rationale_file(path)
+        try:
+            source_file, records = load_rationale_file(path)
+        except ValueError:  # no records in the file
+            skipped.append((path.name, "empty rationale file"))
+            continue
         baseline = {row_id: match for row_id, (match, _rationale) in records.items()}
         input_path = run_config.input_dir_resolved / source_file
         if not input_path.exists():
@@ -553,7 +564,9 @@ def evaluate_full_corpus(scorer: Scorer, run_config: RunConfig) -> FullCorpusRes
             dedupe_truncation_artifact(str(sheet.rows[i].get(sheet.product_details_column) or "")) for i in row_ids
         ]
         scores = score_texts(scorer, texts)
-        predictions = {i: s >= THRESHOLD for i, s in zip(row_ids, scores)}
+        # A failed (NaN) row counts as a disagreement: predicted the opposite of the Baseline verdict.
+        predictions = {i: (not baseline[i]) if math.isnan(s) else s >= THRESHOLD for i, s in zip(row_ids, scores)}
+        failed += sum(math.isnan(s) for s in scores)
         per_file[source_file] = compute_classifier_metrics(baseline, predictions)
         all_baseline.update({(source_file, i): baseline[i] for i in row_ids})
         all_pred.update({(source_file, i): p for i, p in predictions.items()})
@@ -565,6 +578,7 @@ def evaluate_full_corpus(scorer: Scorer, run_config: RunConfig) -> FullCorpusRes
         overall=compute_classifier_metrics(all_baseline, all_pred),
         per_file=per_file,
         skipped=skipped,
+        failed=failed,
     )
 
 
@@ -591,6 +605,9 @@ def build_agreement_report(result: FullCorpusResult, keywords: list[str]) -> dic
         "revision": result.revision,
         "seconds": result.seconds,
         "rows_scored": result.overall.total,
+        "failed_rows": result.failed,
+        "failed_rows_note": "Rows whose score was non-finite or out of range are counted as disagreements "
+        "(included in rows and the agreement rate).",
         **_agreement_counts(result.overall),
         "per_file": {f: _agreement_counts(m) for f, m in sorted(result.per_file.items())},
         "skipped_files": [{"source_file": f, "reason": r} for f, r in result.skipped],
@@ -609,6 +626,8 @@ def render_agreement_markdown(report: dict) -> str:
         "",
         f"- candidate match / Baseline judge no match: {report['candidate_match_baseline_no_match']}",
         f"- candidate no match / Baseline judge match: {report['candidate_no_match_baseline_match']}",
+        *([f"- {report['failed_rows']} row(s) failed (non-finite or out-of-range score), counted as disagreement "
+           "and included in the rate above"] if report["failed_rows"] else []),
         "",
         "| file | rows | agreement with the Baseline judge |",
         "|---|---:|---:|",
@@ -625,12 +644,22 @@ def _run_full_corpus(run_config: RunConfig, args: argparse.Namespace) -> int:
         print("--full-corpus takes exactly one candidate (it is a slow, per-candidate run).", file=sys.stderr)
         return 2
     (scorer,) = build_scorers(args.candidates, run_config.keywords)
-    report = build_agreement_report(evaluate_full_corpus(scorer, run_config), run_config.keywords)
-    json_path = _resolve(run_config, args.agreement_report_path)
-    md_path = _resolve(run_config, args.agreement_markdown_path)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    md_path.write_text(render_agreement_markdown(report), encoding="utf-8")
+    if scorer.gate_eligible is not True:  # a 0.5 cut means nothing for e.g. cosine similarity
+        print(f"{scorer.name} is gate-ineligible (AUROC-only reference); --full-corpus applies a fixed 0.5 cut "
+              "and would be meaningless for it.", file=sys.stderr)
+        return 2
+    try:
+        result = evaluate_full_corpus(scorer, run_config)
+    except Exception as exc:
+        print(f"{scorer.name}: full-corpus run failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    report = build_agreement_report(result, run_config.keywords)
+    json_path, md_path = write_report(
+        report,
+        _resolve(run_config, args.agreement_report_path),
+        _resolve(run_config, args.agreement_markdown_path),
+        render=render_agreement_markdown,
+    )
     print(f"{report['candidate']}: agreement with the Baseline judge = {_fmt(report['agreement_rate'])} "
           f"over {report['rows_scored']} rows")
     print(f"Agreement report written to {json_path} and {md_path}")

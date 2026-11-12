@@ -22,7 +22,7 @@ Don't add fixtures under those paths — tests generate their own workbooks.
 ```bash
 # Env (already created; project is installed editable into it)
 .venv/bin/pip install -e ".[dev]"                  # deps live in pyproject; requirements.txt is `-e .[dev]`
-.venv/bin/python -m pytest -q                      # all tests (48, ~2s, no network/LLM needed)
+.venv/bin/python -m pytest -q                      # all tests (205, ~2s, no network/LLM needed)
 .venv/bin/python -m pytest tests/test_excel_reader.py::test_two_row_header -q   # single test
 
 .venv/bin/agenticxl run                            # full pipeline, config/run_config.yaml

@@ -115,6 +115,24 @@ pytest
 The suite needs no network access and no API key: model calls go through a deterministic
 stub and Excel fixtures are generated on the fly (`tests/helpers.py`).
 
+## System 1 bake-off
+
+An offline comparison of zero-shot models as a replacement relevance judge (issue #10). It is
+not part of the pipeline and needs the optional `bakeoff` extra:
+
+```bash
+.venv/bin/pip install -e ".[bakeoff]"
+.venv/bin/python -m scripts.run_system1_bakeoff                      # all candidates, Ground-truth set
+.venv/bin/python -m scripts.run_system1_bakeoff --candidates qwen3-reranker-0.6b --timing-rows 100
+.venv/bin/python -m scripts.run_system1_bakeoff --full-corpus --candidates qwen3-reranker-0.6b
+```
+
+Run it from the repo root with `-m` (a plain `python scripts/...` cannot import the `scripts`
+package). `--timing-rows N` sets the rows per candidate in the throughput run (`0` skips it).
+`--full-corpus` scores every `logs/*_rationale.jsonl` row and reports agreement with the
+Baseline judge, not accuracy; it takes exactly one gate-eligible candidate. Reports land in
+`logs/system1_bakeoff_report.{json,md}` (and `logs/system1_bakeoff_agreement.{json,md}`).
+
 ## Data handling
 
 Input workbooks, every generated output, and all run logs are gitignored. The rationale logs

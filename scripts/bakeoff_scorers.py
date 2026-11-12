@@ -21,6 +21,7 @@ tuning, so don't.
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Protocol
 
 
@@ -39,6 +40,22 @@ class Scorer(Protocol):
 def fill_template(template: str, keywords: list[str]) -> str:
     """The one place config keywords are folded into a template."""
     return template.format(keywords="; ".join(keywords))
+
+
+def pick_device(torch) -> str:
+    return "mps" if torch.backends.mps.is_available() else "cpu"
+
+
+def load_hf(model_id: str, revision: str, model_cls: str, **tokenizer_kwargs):
+    """Pinned tokenizer + `transformers.<model_cls>` on the best device -> (torch, tok, model, device)."""
+    import torch  # lazy: optional `bakeoff` extra
+    import transformers
+
+    tok = transformers.AutoTokenizer.from_pretrained(model_id, revision=revision, **tokenizer_kwargs)
+    model = getattr(transformers, model_cls).from_pretrained(model_id, revision=revision).eval()
+    device = pick_device(torch)
+    model.to(device)
+    return torch, tok, model, device
 
 
 class Qwen3RerankerScorer:
@@ -71,14 +88,7 @@ class Qwen3RerankerScorer:
 
     def _load(self):
         if self._loaded is None:
-            import torch  # lazy: optional `bakeoff` extra
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-
-            tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision, padding_side="left")
-            model = AutoModelForCausalLM.from_pretrained(self.model_id, revision=self.revision).eval()
-            device = "mps" if torch.backends.mps.is_available() else "cpu"
-            model.to(device)
-            self._loaded = (torch, tok, model, device)
+            self._loaded = load_hf(self.model_id, self.revision, "AutoModelForCausalLM", padding_side="left")
         return self._loaded
 
     def score(self, texts: list[str]) -> list[float]:
@@ -124,14 +134,7 @@ class GteModernBertRerankerScorer:
 
     def _load(self):
         if self._loaded is None:
-            import torch  # lazy: optional `bakeoff` extra
-            from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-            tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
-            model = AutoModelForSequenceClassification.from_pretrained(self.model_id, revision=self.revision).eval()
-            device = "mps" if torch.backends.mps.is_available() else "cpu"
-            model.to(device)
-            self._loaded = (torch, tok, model, device)
+            self._loaded = load_hf(self.model_id, self.revision, "AutoModelForSequenceClassification")
         return self._loaded
 
     def score(self, texts: list[str]) -> list[float]:
@@ -173,14 +176,7 @@ class DebertaNliScorer:
 
     def _load(self):
         if self._loaded is None:
-            import torch  # lazy: optional `bakeoff` extra
-            from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-            tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
-            model = AutoModelForSequenceClassification.from_pretrained(self.model_id, revision=self.revision).eval()
-            device = "mps" if torch.backends.mps.is_available() else "cpu"
-            model.to(device)
-            self._loaded = (torch, tok, model, device)
+            self._loaded = load_hf(self.model_id, self.revision, "AutoModelForSequenceClassification")
         return self._loaded
 
     def _entail(self, pairs: list[tuple[str, str]]) -> list[float]:
@@ -228,7 +224,7 @@ class GLiClassScorer:
 
             model = GLiClassModel.from_pretrained(self.model_id, revision=self.revision)
             tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
-            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            device = pick_device(torch)
             self._pipeline = ZeroShotClassificationPipeline(
                 model, tok, classification_type="multi-label", device=device
             )
@@ -236,7 +232,8 @@ class GLiClassScorer:
 
     def score(self, texts: list[str]) -> list[float]:
         results = self._load()(texts, self._labels, threshold=0.0, batch_size=self._batch_size)
-        return [max((r["score"] for r in per_text), default=0.0) for per_text in results]
+        # no labels back = a bad score (NaN -> per-row failure in the driver), never a silent 0.0
+        return [max((r["score"] for r in per_text), default=math.nan) for per_text in results]
 
 
 class GteEmbeddingScorer:

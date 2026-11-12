@@ -151,3 +151,61 @@ def test_cli_is_off_by_default(tmp_path, monkeypatch):
 
     assert rc == 1
     assert not (tmp_path / "logs" / "system1_bakeoff_agreement.json").exists()
+
+
+# --- review fixes: failed rows, empty logs, raising scorers, gate-ineligible ---
+
+
+def test_nan_scores_are_failed_rows_counted_as_disagreement(tmp_path):
+    _write_corpus(tmp_path)
+    scorer = FakeScorer(lambda t: float("nan") if "usb" in t else _lift_score(t))
+    report = build_agreement_report(evaluate_full_corpus(scorer, _config(tmp_path)), ["lift"])
+    md = render_agreement_markdown(report)
+
+    # failed: "usb cable" (baseline no) and "usb hub" (baseline no) -> each a disagreement
+    assert report["failed_rows"] == 2
+    assert report["rows"] == 6
+    assert report["agree"] == 2  # only a.xlsx rows 0,1 ("scissor lift A/B") agree
+    assert "2 row(s) failed" in md and "disagreement" in md
+
+
+def test_empty_rationale_file_is_skipped_not_fatal(tmp_path):
+    _write_corpus(tmp_path)
+    (tmp_path / "logs" / "empty_rationale.jsonl").write_text("\n")
+
+    result = evaluate_full_corpus(FakeScorer(_lift_score), _config(tmp_path))
+
+    assert ("empty_rationale.jsonl", "empty rationale file") in result.skipped
+    assert result.overall.total == 6
+
+
+def test_cli_scorer_that_raises_exits_nonzero_with_message(tmp_path, monkeypatch, capsys):
+    _write_corpus(tmp_path)
+    cfg = _write_config(tmp_path)
+    scorer = FakeScorer(_lift_score)
+
+    def boom(texts):
+        raise RuntimeError("weights missing")
+
+    scorer.score = boom
+    monkeypatch.setattr(run_system1_bakeoff, "build_scorers", lambda names, kw: [scorer])
+
+    rc = run_system1_bakeoff.main(["--config", cfg, "--full-corpus", "--candidates", "fake"])
+
+    assert rc == 1
+    assert "weights missing" in capsys.readouterr().err
+    assert not (tmp_path / "logs" / "system1_bakeoff_agreement.json").exists()
+
+
+def test_cli_refuses_gate_ineligible_candidate(tmp_path, monkeypatch, capsys):
+    _write_corpus(tmp_path)
+    cfg = _write_config(tmp_path)
+    scorer = FakeScorer(_lift_score)
+    scorer.gate_eligible = False
+    monkeypatch.setattr(run_system1_bakeoff, "build_scorers", lambda names, kw: [scorer])
+
+    rc = run_system1_bakeoff.main(["--config", cfg, "--full-corpus", "--candidates", "fake"])
+
+    assert rc == 2
+    assert "gate-ineligible" in capsys.readouterr().err
+    assert scorer.seen == []
