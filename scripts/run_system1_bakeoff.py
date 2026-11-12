@@ -246,14 +246,55 @@ def measure_throughput(
 # --- report ------------------------------------------------------------------
 
 
+def build_depth(results: list[CandidateResult], sample_rows: list[SampleRow], labels: Labels) -> dict:
+    """Per-file metrics and miss lists per candidate (#14), from the per-row scores
+    kept on each `CandidateResult`. Rows a candidate has no score for are skipped."""
+    per_file: dict[str, dict] = {}
+    misses: dict[str, list] = {}
+    for r in results:
+        if r.status != "ok":  # could-not-run: no scores, nothing to break down
+            continue
+        scored = [row for row in sample_rows if row.sample_index in r.scores]
+        by_file: dict[str, list[SampleRow]] = {}
+        for row in scored:
+            by_file.setdefault(row.source_file, []).append(row)
+        per_file[r.name] = {
+            f: asdict(
+                compute_classifier_metrics(
+                    {x.sample_index: labels[x.sample_index][0] for x in rows},
+                    {x.sample_index: r.scores[x.sample_index] >= THRESHOLD for x in rows},
+                )
+            )
+            for f, rows in sorted(by_file.items())
+        }
+        misses[r.name] = [
+            {
+                "sample_index": row.sample_index,
+                "source_file": row.source_file,
+                "row_id": row.row_id,
+                "kind": "false_negative" if labels[row.sample_index][0] else "false_positive",
+                "score": r.scores[row.sample_index],
+                "text": row.product_details_text,
+            }
+            for row in scored
+            if (r.scores[row.sample_index] >= THRESHOLD) != labels[row.sample_index][0]
+        ]
+    return {"per_file": per_file, "misses": misses}
+
+
 def build_report(
     results: list[CandidateResult],
     keywords: list[str],
     sample_size: int,
     quadrant_pool_sizes: dict[Quadrant, int],
+    sample_rows: list[SampleRow] | None = None,
+    labels: Labels | None = None,
 ) -> dict:
-    """JSON-serialisable report. Add new top-level keys for new report depth (#14)."""
+    """JSON-serialisable report. Add new top-level keys for new report depth (#14).
+    Pass `sample_rows` + `labels` to include the per-file / miss-list depth."""
+    depth = build_depth(results, sample_rows, labels) if sample_rows is not None and labels is not None else {}
     return {
+        **depth,
         "threshold": THRESHOLD,
         "gate": {"population_accuracy": GO_MIN_POPULATION_ACCURACY, "recall": GO_MIN_RECALL},
         "keywords": keywords,
@@ -389,10 +430,61 @@ def _section_failures(report: dict) -> list[str]:
     return [*lines, ""]
 
 
-# Ordered report sections; add a section (e.g. per-file breakdown, miss lists) by adding a function here.
+MISS_TEXT_CHARS = 200  # Markdown only; the JSON keeps the full text
+
+
+def _flat(text: str, limit: int = MISS_TEXT_CHARS) -> str:
+    text = " ".join(text.split()).replace("|", "\\|")
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _section_per_file(report: dict) -> list[str]:
+    if "per_file" not in report:
+        return []
+    lines = ["## Per-file breakdown", "", "Raw (unweighted) metrics at the fixed cut, per source file. Rows with a failed score are listed under "
+        "Failures and not counted here.", ""]
+    for name, files in report["per_file"].items():
+        lines += [
+            f"### {name}",
+            "",
+            "| file | rows | accuracy | precision | recall | F1 | FN | FP |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        lines += [
+            f"| {f} | {m['total']} | {_fmt(m['accuracy'])} | {_fmt(m['precision'])} | {_fmt(m['recall'])} "
+            f"| {_fmt(m['f1'])} | {m['false_negatives']} | {m['false_positives']} |"
+            for f, m in files.items()
+        ]
+        lines.append("")
+    return lines
+
+
+def _section_misses(report: dict) -> list[str]:
+    if "misses" not in report:
+        return []
+    lines = [
+        "## Missed Ground-truth rows",
+        "",
+        f"Rows each candidate gets wrong at the fixed cut (text truncated to {MISS_TEXT_CHARS} chars here; "
+        "full text in the JSON report). Failed-score rows are listed under Failures, not here.",
+        "",
+    ]
+    for name, rows in report["misses"].items():
+        lines += [f"### {name} ({len(rows)} missed)", ""]
+        lines += [
+            f"- {m['kind']} | score {m['score']:.3f} | {m['source_file']} row {m['row_id']}: {_flat(m['text'])}"
+            for m in rows
+        ]
+        lines.append("")
+    return lines
+
+
+# Ordered report sections; add a section by adding a function here.
 _SECTIONS = [
     _section_header,
     _section_comparison,
+    _section_per_file,
+    _section_misses,
     _section_failures,
     _section_throughput,
     _section_models,
@@ -451,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
 
     scorers = build_scorers(args.candidates, run_config.keywords)
     results = run_bakeoff(scorers, sample_rows, labels, pool_sizes)
-    report = build_report(results, run_config.keywords, len(sample_rows), pool_sizes)
+    report = build_report(results, run_config.keywords, len(sample_rows), pool_sizes, sample_rows, labels)
     if args.timing_rows > 0:
         report["throughput"] = measure_throughput(scorers, sample_rows, args.timing_rows)
     json_path, md_path = write_report(
