@@ -239,12 +239,61 @@ class GLiClassScorer:
         return [max((r["score"] for r in per_text), default=0.0) for per_text in results]
 
 
+class GteEmbeddingScorer:
+    """gte-large-en-v1.5 embedding similarity, an AUROC-only REFERENCE (#19).
+
+    score = (max cosine over keyword embeddings + 1) / 2, a monotone rescale of
+    cosine from [-1, 1] to [0, 1]. Cosine similarity has no meaningful 0.5, so
+    `gate_eligible` is False: only AUROC is reported and it never gets a verdict.
+    gte-v1.5 takes no instruction prefix, so the frozen template embeds each
+    keyword bare (`fill_template(template, [keyword])`); texts are embedded as-is."""
+
+    name = "gte-large-en-v1.5"
+    model_id = "Alibaba-NLP/gte-large-en-v1.5"
+    revision = "104333d6af6f97649377c2afbde10a7704870c7b"
+    gate_eligible = False
+    template = "{keywords}"
+    # The model ships no modeling code of its own: its config's auto_map points at this repo
+    # (executed via trust_remote_code), so pin it as well.
+    code_model_id = "Alibaba-NLP/new-impl"
+    code_revision = "40ced75c3017eb27626c9d4ea981bde21a2662f4"
+
+    def __init__(self, keywords: list[str], batch_size: int = 16, max_seq_length: int = 1024):
+        self._keyword_texts = [fill_template(self.template, [k]) for k in keywords]
+        self._batch_size = batch_size
+        self._max_seq_length = max_seq_length
+        self._loaded = None
+
+    def _load(self):
+        if self._loaded is None:
+            from sentence_transformers import SentenceTransformer  # lazy: optional `bakeoff` extra
+
+            code = {"code_revision": self.code_revision}
+            model = SentenceTransformer(
+                self.model_id,
+                revision=self.revision,
+                trust_remote_code=True,
+                config_kwargs=code,
+                model_kwargs=code,
+            )
+            model.max_seq_length = self._max_seq_length
+            self._loaded = (model, model.encode(self._keyword_texts, normalize_embeddings=True))
+        return self._loaded
+
+    def score(self, texts: list[str]) -> list[float]:
+        model, keyword_vecs = self._load()
+        vecs = model.encode(texts, batch_size=self._batch_size, normalize_embeddings=True)
+        best = (vecs @ keyword_vecs.T).max(axis=1)
+        return [min(1.0, max(0.0, (float(c) + 1.0) / 2.0)) for c in best]
+
+
 # Registry: candidate name -> factory(keywords) -> Scorer. One line per candidate.
 CANDIDATES: dict[str, Callable[[list[str]], Scorer]] = {
     Qwen3RerankerScorer.name: Qwen3RerankerScorer,
     GteModernBertRerankerScorer.name: GteModernBertRerankerScorer,
     DebertaNliScorer.name: DebertaNliScorer,
     GLiClassScorer.name: GLiClassScorer,
+    GteEmbeddingScorer.name: GteEmbeddingScorer,
 }
 
 

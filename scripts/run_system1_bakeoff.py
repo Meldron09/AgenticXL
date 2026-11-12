@@ -120,7 +120,7 @@ def auroc(truth: list[bool], scores: list[float]) -> float | None:
 
 def determine_verdict(population_accuracy: float, population_recall: float, gate_eligible: bool) -> str:
     """GO gate at the fixed cut. AUROC is deliberately not an input."""
-    if not gate_eligible:
+    if gate_eligible is not True:  # strict: anything but literal True can never pass
         return "AUROC-only"
     if population_accuracy >= GO_MIN_POPULATION_ACCURACY and population_recall >= GO_MIN_RECALL:
         return "GO"
@@ -252,7 +252,7 @@ def build_depth(results: list[CandidateResult], sample_rows: list[SampleRow], la
     per_file: dict[str, dict] = {}
     misses: dict[str, list] = {}
     for r in results:
-        if r.status != "ok":  # could-not-run: no scores, nothing to break down
+        if r.status != "ok" or r.gate_eligible is not True:  # no scores / AUROC-only: threshold breakdown is meaningless
             continue
         scored = [row for row in sample_rows if row.sample_index in r.scores]
         by_file: dict[str, list[SampleRow]] = {}
@@ -292,6 +292,9 @@ def build_report(
 ) -> dict:
     """JSON-serialisable report. Add new top-level keys for new report depth (#14).
     Pass `sample_rows` + `labels` to include the per-file / miss-list depth."""
+    for r in results:
+        if r.status == "ok" and r.gate_eligible is not True and r.verdict != "AUROC-only":
+            raise ValueError(f"{r.name} is gate-ineligible but has verdict {r.verdict!r}; refusing to report it")
     depth = build_depth(results, sample_rows, labels) if sample_rows is not None and labels is not None else {}
     return {
         **depth,
@@ -351,6 +354,9 @@ def _section_comparison(report: dict) -> list[str]:
         p, r = c["population_weighted"], c["raw"]
         if c["status"] != "ok":
             lines.append(f"| {c['name']} | {c['verdict']} |" + " n/a |" * 9)
+            continue
+        if c["gate_eligible"] is not True:  # reference: AUROC only, no threshold metrics
+            lines.append(f"| {c['name']} | {c['verdict']} |{' n/a |' * 8} {_fmt(c['auroc'])} |")
             continue
         lines.append(
             f"| {c['name']} | {c['verdict']} | {_fmt(p['accuracy'])} | {_fmt(p['precision'])} | {_fmt(p['recall'])} "
@@ -553,6 +559,9 @@ def main(argv: list[str] | None = None) -> int:
     for r in results:
         if r.status != "ok":
             print(f"{r.name}: could not run ({r.error})")
+            continue
+        if r.gate_eligible is not True:
+            print(f"{r.name}: {r.verdict}  AUROC={_fmt(r.auroc)}")
             continue
         print(f"{r.name}: {r.verdict}  pop. accuracy={r.population_weighted.accuracy:.1%}  "
               f"pop. recall={r.population_weighted.recall:.1%}  AUROC={_fmt(r.auroc)}")
