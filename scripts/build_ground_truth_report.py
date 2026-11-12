@@ -464,47 +464,58 @@ def _weighted_metrics(weighted_tp: float, weighted_fp: float, weighted_fn: float
     )
 
 
+def population_weighted_metrics(
+    sample_rows: list[SampleRow],
+    ground_truth_labels: dict[int, tuple[bool, str]],
+    quadrant_pool_sizes: dict[Quadrant, int],
+    predictions: dict[int, bool],
+) -> ClassifierMetrics:
+    """Population-reweighted accuracy/precision/recall/F1 for ANY classifier.
+
+    Standard stratified-sampling (Horvitz-Thompson-style) correction: the
+    sample deliberately oversamples disagreement quadrants relative to their
+    true share of the corpus, so a flat/unweighted accuracy over the raw
+    sample misrepresents "how often is this classifier right across the
+    whole dataset." Reweights each quadrant's confusion-matrix counts by
+    `quadrant_pool_sizes[quadrant] / (sampled rows in that quadrant)`.
+
+    `predictions` maps `sample_index` -> predicted match for the classifier
+    being scored. The quadrants (and so the weights) are fixed by the sample's
+    laya/baseline strata, so the correction is unbiased for any classifier."""
+    rows_by_quadrant: dict[Quadrant, list[SampleRow]] = {}
+    for row in sample_rows:
+        rows_by_quadrant.setdefault(row.quadrant, []).append(row)
+
+    wtp = wfp = wfn = wtn = 0.0
+    for quadrant, rows in rows_by_quadrant.items():
+        weight = quadrant_pool_sizes.get(quadrant, len(rows)) / len(rows)
+        for row in rows:
+            truth = ground_truth_labels[row.sample_index][0]
+            predicted = predictions[row.sample_index]
+            if truth and predicted:
+                wtp += weight
+            elif truth and not predicted:
+                wfn += weight
+            elif not truth and predicted:
+                wfp += weight
+            else:
+                wtn += weight
+    return _weighted_metrics(wtp, wfp, wfn, wtn)
+
+
 def population_weighted_overall(
     sample_rows: list[SampleRow],
     ground_truth_labels: dict[int, tuple[bool, str]],
     quadrant_pool_sizes: dict[Quadrant, int],
 ) -> GroundTruthComparisonReport:
-    """Standard stratified-sampling (Horvitz-Thompson-style) correction: the
-    sample deliberately oversamples disagreement quadrants relative to their
-    true share of the corpus, so a flat/unweighted accuracy over the raw
-    sample misrepresents "how often is this classifier right across the
-    whole dataset." Reweights each quadrant's confusion-matrix counts by
-    `quadrant_pool_sizes[quadrant] / (sampled rows in that quadrant)` before
-    recomputing accuracy/precision/recall/F1, for laya and the LLM baseline
-    independently."""
-    rows_by_quadrant: dict[Quadrant, list[SampleRow]] = {}
-    for row in sample_rows:
-        rows_by_quadrant.setdefault(row.quadrant, []).append(row)
-
-    def _weighted_confusion(predict_fn) -> ClassifierMetrics:
-        wtp = wfp = wfn = wtn = 0.0
-        for quadrant, rows in rows_by_quadrant.items():
-            sampled_n = len(rows)
-            if sampled_n == 0:
-                continue
-            pool_n = quadrant_pool_sizes.get(quadrant, sampled_n)
-            weight = pool_n / sampled_n
-            for row in rows:
-                truth = ground_truth_labels[row.sample_index][0]
-                predicted = predict_fn(row)
-                if truth and predicted:
-                    wtp += weight
-                elif truth and not predicted:
-                    wfn += weight
-                elif not truth and predicted:
-                    wfp += weight
-                else:
-                    wtn += weight
-        return _weighted_metrics(wtp, wfp, wfn, wtn)
-
+    """`population_weighted_metrics` for laya and the LLM baseline independently."""
     return GroundTruthComparisonReport(
-        laya=_weighted_confusion(lambda r: r.laya_match),
-        llm_baseline=_weighted_confusion(lambda r: r.llm_match),
+        laya=population_weighted_metrics(
+            sample_rows, ground_truth_labels, quadrant_pool_sizes, {r.sample_index: r.laya_match for r in sample_rows}
+        ),
+        llm_baseline=population_weighted_metrics(
+            sample_rows, ground_truth_labels, quadrant_pool_sizes, {r.sample_index: r.llm_match for r in sample_rows}
+        ),
     )
 
 

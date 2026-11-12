@@ -24,6 +24,7 @@ from scripts.build_ground_truth_report import (
     load_ground_truth_sample,
     load_laya_predictions,
     load_rationale_file,
+    population_weighted_metrics,
     population_weighted_overall,
     write_ground_truth_sample,
 )
@@ -489,3 +490,27 @@ def test_ground_truth_sample_round_trips_through_write_and_load(tmp_path):
     assert result_path == path
     loaded = load_ground_truth_sample(path)
     assert loaded == rows
+
+
+def test_population_weighted_metrics_scores_arbitrary_predictions_with_the_same_weighting():
+    # Same oversampled setup as above: 9/900 both_match rows, 91/100 laya_false_negative rows.
+    sample_rows = [
+        _sample_row(sample_index=i, quadrant="both_match", laya_match=True, llm_match=True) for i in range(9)
+    ] + [
+        _sample_row(sample_index=100 + i, quadrant="laya_false_negative", laya_match=False, llm_match=True)
+        for i in range(91)
+    ]
+    labels = {r.sample_index: (True, "relevant") for r in sample_rows}
+    pool_sizes = {"both_match": 900, "both_no_match": 0, "laya_false_negative": 100, "laya_false_positive": 0}
+
+    # A third classifier that is right on both_match but wrong on laya_false_negative == laya.
+    preds = {r.sample_index: r.quadrant == "both_match" for r in sample_rows}
+    m = population_weighted_metrics(sample_rows, labels, pool_sizes, preds)
+    assert m.accuracy == pytest.approx(0.9)
+    assert m.recall == pytest.approx(0.9)
+
+    # The baseline judge's own verdicts reproduce population_weighted_overall exactly.
+    llm_preds = {r.sample_index: r.llm_match for r in sample_rows}
+    assert population_weighted_metrics(sample_rows, labels, pool_sizes, llm_preds) == population_weighted_overall(
+        sample_rows, labels, pool_sizes
+    ).llm_baseline
