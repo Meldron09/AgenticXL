@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -155,6 +157,58 @@ def run_bakeoff(
     return [evaluate_candidate(s, sample_rows, labels, quadrant_pool_sizes) for s in scorers]
 
 
+# --- throughput (#15) --------------------------------------------------------
+# A separate timing run, never part of `evaluate_candidate`: it reads no labels
+# and produces no predictions, so it cannot touch the accuracy figures.
+
+TIMING_ROWS = 500
+
+
+def describe_hardware() -> str:
+    try:  # macOS: "Apple M1"
+        chip = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except Exception:
+        chip = ""
+    return f"{chip or platform.processor() or platform.machine()} ({platform.platform()})"
+
+
+def measure_throughput(
+    scorers: list[Scorer],
+    sample_rows: list[SampleRow],
+    timing_rows: int = TIMING_ROWS,
+    hardware: str | None = None,
+    clock=time.perf_counter,
+) -> dict:
+    """Rows per second per candidate on the first `timing_rows` distinct texts.
+
+    One untimed single-text warm-up call first, so lazy model loading is not
+    billed to throughput. Calls `scorer.score` directly (not `score_texts`), so
+    this is the model's own rate regardless of any dedup layered on top. A
+    scorer that raises is reported, never fatal."""
+    texts = list(dict.fromkeys(r.product_details_text for r in sample_rows))[:timing_rows]
+    candidates = []
+    for s in scorers:
+        entry = {"name": s.name, "rows": len(texts), "seconds": None, "rows_per_second": None,
+                 "status": "ok", "error": None}
+        try:
+            s.score(texts[:1])
+            start = clock()
+            s.score(texts)
+            entry["seconds"] = clock() - start
+            entry["rows_per_second"] = len(texts) / entry["seconds"]
+        except Exception as exc:
+            entry.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        candidates.append(entry)
+    return {
+        "basis": "measured",
+        "hardware": hardware if hardware is not None else describe_hardware(),
+        "timing_rows": timing_rows,
+        "candidates": candidates,
+    }
+
+
 # --- report ------------------------------------------------------------------
 
 
@@ -226,6 +280,29 @@ def _section_comparison(report: dict) -> list[str]:
     return [*lines, ""]
 
 
+def _section_throughput(report: dict) -> list[str]:
+    t = report.get("throughput")
+    if not t:
+        return []
+    corpus_rows = sum(report.get("quadrant_pool_sizes", {}).values())
+    lines = [
+        "## Measured throughput",
+        "",
+        f"Measured on: {t['hardware']}. Timing run: up to {t['timing_rows']} distinct Ground-truth set row texts per "
+        "candidate, after an untimed warm-up call. Separate from the accuracy run; does not affect any accuracy figure.",
+        "",
+        f"| candidate | rows timed | seconds | rows/sec (measured) | full corpus ({corpus_rows} rows), extrapolated |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for c in t["candidates"]:
+        if c["status"] != "ok":
+            lines.append(f"| {c['name']} | {c['rows']} | n/a | could not run: {c['error']} | n/a |")
+            continue
+        eta = f"{corpus_rows / c['rows_per_second']:.0f} s" if corpus_rows else "n/a"
+        lines.append(f"| {c['name']} | {c['rows']} | {c['seconds']:.1f} | {c['rows_per_second']:.1f} | {eta} |")
+    return [*lines, ""]
+
+
 def _section_models(report: dict) -> list[str]:
     lines = ["## Models and frozen templates", ""]
     for c in report["candidates"]:
@@ -259,7 +336,7 @@ def _section_caveats(report: dict) -> list[str]:
 
 
 # Ordered report sections; add a section (e.g. per-file breakdown, miss lists) by adding a function here.
-_SECTIONS = [_section_header, _section_comparison, _section_models, _section_caveats]
+_SECTIONS = [_section_header, _section_comparison, _section_throughput, _section_models, _section_caveats]
 
 
 def render_markdown(report: dict) -> str:
@@ -296,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         help="The laya cut the sample was stratified at (NOT a bake-off threshold; that is fixed at 0.5).",
     )
     parser.add_argument("--candidates", nargs="+", default=list(CANDIDATES), help=f"Known: {sorted(CANDIDATES)}")
+    parser.add_argument("--timing-rows", type=int, default=TIMING_ROWS, help="Rows per candidate in the throughput run; 0 skips it.")
     parser.add_argument("--report-path", default="logs/system1_bakeoff_report.json")
     parser.add_argument("--markdown-path", default="logs/system1_bakeoff_report.md")
     args = parser.parse_args(argv)
@@ -313,6 +391,8 @@ def main(argv: list[str] | None = None) -> int:
     scorers = build_scorers(args.candidates, run_config.keywords)
     results = run_bakeoff(scorers, sample_rows, labels, pool_sizes)
     report = build_report(results, run_config.keywords, len(sample_rows), pool_sizes)
+    if args.timing_rows > 0:
+        report["throughput"] = measure_throughput(scorers, sample_rows, args.timing_rows)
     json_path, md_path = write_report(
         report, _resolve(run_config, args.report_path), _resolve(run_config, args.markdown_path)
     )
