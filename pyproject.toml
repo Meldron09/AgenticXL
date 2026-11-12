@@ -22,6 +22,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Model runtimes for scripts/run_system1_bakeoff.py (issue #10). Not needed by the pipeline.
+bakeoff = ["torch>=2.3", "transformers>=4.51", "sentence-transformers>=3.0", "gliclass"]
 
 [project.scripts]
 agenticxl = "agenticxl.cli:cli"
