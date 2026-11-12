@@ -104,7 +104,7 @@ def auroc(truth: list[bool], scores: list[float]) -> float | None:
 
 def determine_verdict(population_accuracy: float, population_recall: float, gate_eligible: bool) -> str:
     """GO gate at the fixed cut. AUROC is deliberately not an input."""
-    if not gate_eligible:
+    if gate_eligible is not True:  # strict: anything but literal True can never pass
         return "AUROC-only"
     if population_accuracy >= GO_MIN_POPULATION_ACCURACY and population_recall >= GO_MIN_RECALL:
         return "GO"
@@ -165,6 +165,9 @@ def build_report(
     quadrant_pool_sizes: dict[Quadrant, int],
 ) -> dict:
     """JSON-serialisable report. Add new top-level keys for new report depth (#14)."""
+    for r in results:
+        if r.gate_eligible is not True and r.verdict != "AUROC-only":
+            raise ValueError(f"{r.name} is gate-ineligible but has verdict {r.verdict!r}; refusing to report it")
     return {
         "threshold": THRESHOLD,
         "gate": {"population_accuracy": GO_MIN_POPULATION_ACCURACY, "recall": GO_MIN_RECALL},
@@ -218,6 +221,9 @@ def _section_comparison(report: dict) -> list[str]:
     ]
     for c in report["candidates"]:
         p, r = c["population_weighted"], c["raw"]
+        if c["gate_eligible"] is not True:  # reference: AUROC only, no threshold metrics
+            lines.append(f"| {c['name']} | {c['verdict']} |{' n/a |' * 8} {_fmt(c['auroc'])} |")
+            continue
         lines.append(
             f"| {c['name']} | {c['verdict']} | {_fmt(p['accuracy'])} | {_fmt(p['precision'])} | {_fmt(p['recall'])} "
             f"| {_fmt(p['f1'])} | {_fmt(r['accuracy'])} | {_fmt(r['precision'])} | {_fmt(r['recall'])} "
@@ -318,6 +324,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     for r in results:
+        if r.gate_eligible is not True:
+            print(f"{r.name}: {r.verdict}  AUROC={_fmt(r.auroc)}")
+            continue
         print(f"{r.name}: {r.verdict}  pop. accuracy={r.population_weighted.accuracy:.1%}  "
               f"pop. recall={r.population_weighted.recall:.1%}  AUROC={_fmt(r.auroc)}")
     print(f"Report written to {json_path} and {md_path}")
