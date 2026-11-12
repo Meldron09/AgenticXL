@@ -135,3 +135,17 @@ Tests never hit a network or a real model. `tests/helpers.py` provides `FakeLLMC
 prompt → the structured dict or text to return) and `write_synthetic_workbook`. Tests import it
 as `from helpers import FakeLLMClient`, relying on pytest's rootdir-relative path insertion —
 there is no `conftest.py`, and `pythonpath = ["src"]` is set in `pyproject.toml`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub Issues in `Meldron09/AgenticXL`, managed via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five canonical roles, used as-is (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
