@@ -101,9 +101,64 @@ class Qwen3RerankerScorer:
         return out
 
 
+def max_per_row(flat: list[float], n_keywords: int) -> list[float]:
+    """Collapse row-major (row, keyword) probabilities to one max per row."""
+    return [max(flat[i : i + n_keywords]) for i in range(0, len(flat), n_keywords)]
+
+
+class DebertaNliScorer:
+    """DeBERTa-v3-large zeroshot v2.0 (NLI): one hypothesis per keyword, the row
+    text is the premise; row score = max entailment probability over keywords.
+    Entailment probability = softmax over the (entailment, not_entailment) logits,
+    as in the model card's multi_label=True pipeline."""
+
+    name = "deberta-v3-large-zeroshot-v2.0"
+    model_id = "MoritzLaurer/deberta-v3-large-zeroshot-v2.0"
+    revision = "cf44676c28ba7312e5c5f8f8d2c22b3e0c9cdae2"
+    gate_eligible = True
+    template = "This shipment record describes {keywords}."  # filled with ONE keyword per hypothesis
+
+    def __init__(self, keywords: list[str], batch_size: int = 16, max_length: int = 512):
+        self._hypotheses = [fill_template(self.template, [k]) for k in keywords]
+        self._batch_size = batch_size
+        self._max_length = max_length
+        self._loaded = None
+
+    def _load(self):
+        if self._loaded is None:
+            import torch  # lazy: optional `bakeoff` extra
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
+            model = AutoModelForSequenceClassification.from_pretrained(self.model_id, revision=self.revision).eval()
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            model.to(device)
+            self._loaded = (torch, tok, model, device)
+        return self._loaded
+
+    def _entail(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Entailment probability per (premise, hypothesis) pair; the only model-touching step."""
+        torch, tok, model, device = self._load()
+        ent = model.config.label2id["entailment"]
+        out: list[float] = []
+        for i in range(0, len(pairs), self._batch_size):
+            chunk = pairs[i : i + self._batch_size]
+            enc = tok([p for p, _ in chunk], [h for _, h in chunk], padding=True, truncation="only_first",
+                      max_length=self._max_length, return_tensors="pt").to(device)
+            with torch.no_grad():
+                logits = model(**enc).logits
+            out.extend(torch.softmax(logits.float(), dim=1)[:, ent].cpu().tolist())
+        return out
+
+    def score(self, texts: list[str]) -> list[float]:
+        pairs = [(t, h) for t in texts for h in self._hypotheses]
+        return max_per_row(self._entail(pairs), len(self._hypotheses))
+
+
 # Registry: candidate name -> factory(keywords) -> Scorer. One line per candidate.
 CANDIDATES: dict[str, Callable[[list[str]], Scorer]] = {
     Qwen3RerankerScorer.name: Qwen3RerankerScorer,
+    DebertaNliScorer.name: DebertaNliScorer,
 }
 
 
