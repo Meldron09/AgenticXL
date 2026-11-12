@@ -32,9 +32,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from agenticxl.config import RunConfig
@@ -67,25 +68,38 @@ class CandidateResult:
     revision: str
     template: str
     gate_eligible: bool
-    status: str  # "ok" (#13 adds "could_not_run")
+    status: str  # "ok" | "could_not_run"
     seconds: float
     raw: ClassifierMetrics
     population_weighted: ClassifierMetrics
     auroc: float | None
     verdict: str  # "GO" | "NO-GO" | "AUROC-only"
     scores: dict[int, float]  # sample_index -> probability (kept for #14 miss lists; not in the JSON)
+    failed_rows: list[int] = field(default_factory=list)  # sample_index of rows with a non-finite / out-of-range score (#13)
+    error: str | None = None  # reason, when status == "could_not_run" (#13)
 
 
 # --- scoring -----------------------------------------------------------------
 
 
 def score_texts(scorer: Scorer, texts: list[str]) -> list[float]:
-    """One probability per text, in order. Dedup of identical texts and
-    per-row bad-score handling (#13) belong here."""
-    scores = scorer.score(texts)
-    if len(scores) != len(texts):
-        raise ValueError(f"{scorer.name} returned {len(scores)} scores for {len(texts)} texts")
-    return scores
+    """One probability per text, in order. Byte-identical texts are scored
+    once and share the score. A score that is not a finite number in [0, 1]
+    comes back as NaN (a per-row failure); a wrong score count raises."""
+    unique = list(dict.fromkeys(texts))
+    scores = scorer.score(unique)
+    if len(scores) != len(unique):
+        raise ValueError(f"{scorer.name} returned {len(scores)} scores for {len(unique)} texts")
+    by_text = {t: _valid_or_nan(s) for t, s in zip(unique, scores)}
+    return [by_text[t] for t in texts]
+
+
+def _valid_or_nan(score) -> float:
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        return math.nan
+    return score if 0.0 <= score <= 1.0 else math.nan  # NaN fails both comparisons; so does out of range
 
 
 # --- metrics -----------------------------------------------------------------
@@ -124,9 +138,12 @@ def evaluate_candidate(
     scores = score_texts(scorer, [r.product_details_text for r in sample_rows])
     seconds = time.perf_counter() - start
 
-    by_index = {r.sample_index: s for r, s in zip(sample_rows, scores)}
-    predictions = {i: s >= THRESHOLD for i, s in by_index.items()}
     truth = {r.sample_index: labels[r.sample_index][0] for r in sample_rows}
+    all_scores = {r.sample_index: s for r, s in zip(sample_rows, scores)}
+    failed = [i for i, s in all_scores.items() if math.isnan(s)]
+    by_index = {i: s for i, s in all_scores.items() if i not in failed}
+    # A failed row is still scored in the metrics, always counted wrong.
+    predictions = {i: (not truth[i]) if i in failed else s >= THRESHOLD for i, s in all_scores.items()}
 
     raw = compute_classifier_metrics(truth, predictions)
     weighted = population_weighted_metrics(sample_rows, labels, quadrant_pool_sizes, predictions)
@@ -143,6 +160,16 @@ def evaluate_candidate(
         auroc=auroc([truth[i] for i in by_index], list(by_index.values())),
         verdict=determine_verdict(weighted.accuracy, weighted.recall, scorer.gate_eligible),
         scores=by_index,
+        failed_rows=failed,
+    )
+
+
+def _could_not_run(scorer: Scorer, seconds: float, error: str) -> CandidateResult:
+    zero = ClassifierMetrics(0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)  # placeholder; the report shows n/a
+    return CandidateResult(
+        name=scorer.name, model_id=scorer.model_id, revision=scorer.revision, template=scorer.template,
+        gate_eligible=scorer.gate_eligible, status="could_not_run", seconds=seconds, raw=zero,
+        population_weighted=zero, auroc=None, verdict="COULD-NOT-RUN", scores={}, error=error,
     )
 
 
@@ -152,7 +179,14 @@ def run_bakeoff(
     labels: Labels,
     quadrant_pool_sizes: dict[Quadrant, int],
 ) -> list[CandidateResult]:
-    return [evaluate_candidate(s, sample_rows, labels, quadrant_pool_sizes) for s in scorers]
+    results = []
+    for s in scorers:
+        start = time.perf_counter()
+        try:
+            results.append(evaluate_candidate(s, sample_rows, labels, quadrant_pool_sizes))
+        except Exception as e:  # one broken candidate must not sink the others
+            results.append(_could_not_run(s, time.perf_counter() - start, f"{type(e).__name__}: {e}"))
+    return results
 
 
 # --- report ------------------------------------------------------------------
@@ -184,6 +218,8 @@ def build_report(
                 "population_weighted": asdict(r.population_weighted),
                 "auroc": r.auroc,
                 "verdict": r.verdict,
+                "failed_rows": r.failed_rows,
+                "error": r.error,
             }
             for r in results
         ],
@@ -218,6 +254,9 @@ def _section_comparison(report: dict) -> list[str]:
     ]
     for c in report["candidates"]:
         p, r = c["population_weighted"], c["raw"]
+        if c["status"] != "ok":
+            lines.append(f"| {c['name']} | {c['verdict']} |" + " n/a |" * 9)
+            continue
         lines.append(
             f"| {c['name']} | {c['verdict']} | {_fmt(p['accuracy'])} | {_fmt(p['precision'])} | {_fmt(p['recall'])} "
             f"| {_fmt(p['f1'])} | {_fmt(r['accuracy'])} | {_fmt(r['precision'])} | {_fmt(r['recall'])} "
@@ -258,8 +297,23 @@ def _section_caveats(report: dict) -> list[str]:
     ]
 
 
+def _section_failures(report: dict) -> list[str]:
+    cnr = [c for c in report["candidates"] if c["status"] != "ok"]
+    bad = [c for c in report["candidates"] if c.get("failed_rows")]
+    if not (cnr or bad):
+        return []
+    lines = ["## Failures", ""]
+    lines += [f"- {c['name']}: could not run: {c['error']}" for c in cnr]
+    lines += [
+        f"- {c['name']}: {len(c['failed_rows'])} row(s) failed (non-finite or out-of-range score; "
+        f"counted wrong in the metrics, excluded from AUROC): sample_index {c['failed_rows']}"
+        for c in bad
+    ]
+    return [*lines, ""]
+
+
 # Ordered report sections; add a section (e.g. per-file breakdown, miss lists) by adding a function here.
-_SECTIONS = [_section_header, _section_comparison, _section_models, _section_caveats]
+_SECTIONS = [_section_header, _section_comparison, _section_failures, _section_models, _section_caveats]
 
 
 def render_markdown(report: dict) -> str:
@@ -318,6 +372,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     for r in results:
+        if r.status != "ok":
+            print(f"{r.name}: could not run ({r.error})")
+            continue
         print(f"{r.name}: {r.verdict}  pop. accuracy={r.population_weighted.accuracy:.1%}  "
               f"pop. recall={r.population_weighted.recall:.1%}  AUROC={_fmt(r.auroc)}")
     print(f"Report written to {json_path} and {md_path}")
